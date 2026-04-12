@@ -243,10 +243,6 @@ static bool isCmpInstruction(unsigned Opc) {
   }
 }
 
-static bool isCSINCInstruction(unsigned Opc) {
-  return Opc == AArch64::CSINCWr || Opc == AArch64::CSINCXr;
-}
-
 // Returns the Bcc terminator if present, otherwise nullptr.
 MachineInstr *
 AArch64ConditionOptimizerImpl::getBccTerminator(MachineBasicBlock *MBB) {
@@ -563,7 +559,8 @@ bool AArch64ConditionOptimizerImpl::optimizeIntraBlock(MachineBasicBlock &MBB) {
       continue;
     }
 
-    if (isCSINCInstruction(MI.getOpcode())) {
+    if (AArch64InstrInfo::findCondCodeUseOperandIdxForBranchOrSelect(MI) >= 0 &&
+        !MI.isBranch()) {
       if (PendingPair) {
         // A second conditional consuming the same CMP would invalidate any
         // optimization: modifying the CMP would silently change what both
