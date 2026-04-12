@@ -94,7 +94,9 @@ using namespace llvm;
 
 #define DEBUG_TYPE "aarch64-condopt"
 
-STATISTIC(NumConditionsAdjusted, "Number of conditions adjusted");
+STATISTIC(NumOptimized, "Number of pairs optimized");
+STATISTIC(NumOptimizedIntra, "Number of intra-block pairs optimized");
+STATISTIC(NumOptimizedCross, "Number of cross-block pairs optimized");
 
 namespace {
 
@@ -137,7 +139,8 @@ private:
   void applyCmpAdjustment(CmpCondPair &Pair, const CmpInfo &Info);
   bool commitPendingPair(std::optional<CmpCondPair> &PendingPair,
                          DenseMap<Register, CmpCondPair> &PairsByReg);
-  bool tryOptimizePair(CmpCondPair &First, CmpCondPair &Second);
+  enum class OptPath { Intra, Cross };
+  bool tryOptimizePair(CmpCondPair &First, CmpCondPair &Second, OptPath Path);
   bool optimizeIntraBlock(MachineBasicBlock &MBB);
   bool optimizeCrossBlock(MachineBasicBlock &HBB);
 };
@@ -391,7 +394,6 @@ void AArch64ConditionOptimizerImpl::updateCondInstr(MachineInstr *CondMI,
       AArch64InstrInfo::findCondCodeUseOperandIdxForBranchOrSelect(*CondMI);
   assert(CCOpIdx >= 0 && "Unsupported conditional instruction");
   CondMI->getOperand(CCOpIdx).setImm(NewCC);
-  ++NumConditionsAdjusted;
 }
 
 // Applies a comparison adjustment to a cmp/cond instruction pair.
@@ -423,7 +425,8 @@ static bool isLessThan(AArch64CC::CondCode Cmp) {
 }
 
 bool AArch64ConditionOptimizerImpl::tryOptimizePair(CmpCondPair &First,
-                                                    CmpCondPair &Second) {
+                                                    CmpCondPair &Second,
+                                                    OptPath Path) {
   if (!((isGreaterThan(First.CC) || isLessThan(First.CC)) &&
         (isGreaterThan(Second.CC) || isLessThan(Second.CC))))
     return false;
@@ -470,6 +473,8 @@ bool AArch64ConditionOptimizerImpl::tryOptimizePair(CmpCondPair &First,
                       << SecondAdj.Imm << '\n');
     applyCmpAdjustment(First, FirstAdj);
     applyCmpAdjustment(Second, SecondAdj);
+    ++NumOptimized;
+    ++(Path == OptPath::Intra ? NumOptimizedIntra : NumOptimizedCross);
     return true;
 
   } else if (((isGreaterThan(First.CC) && isGreaterThan(Second.CC)) ||
@@ -506,6 +511,8 @@ bool AArch64ConditionOptimizerImpl::tryOptimizePair(CmpCondPair &First,
                       << AArch64CC::getCondCodeName(Adj.CC) << " #" << Adj.Imm
                       << '\n');
     applyCmpAdjustment(ToChange, Adj);
+    ++NumOptimized;
+    ++(Path == OptPath::Intra ? NumOptimizedIntra : NumOptimizedCross);
     return true;
   }
 
@@ -524,8 +531,9 @@ bool AArch64ConditionOptimizerImpl::commitPendingPair(
   Register Key = Reg.isVirtual() ? TRI->lookThruCopyLike(Reg, MRI) : Reg;
 
   auto MatchingPair = PairsByReg.find(Key);
-  bool Changed = MatchingPair != PairsByReg.end() &&
-                 tryOptimizePair(MatchingPair->second, *PendingPair);
+  bool Changed =
+      MatchingPair != PairsByReg.end() &&
+      tryOptimizePair(MatchingPair->second, *PendingPair, OptPath::Intra);
 
   PairsByReg[Key] = *PendingPair;
   PendingPair = std::nullopt;
@@ -663,7 +671,7 @@ bool AArch64ConditionOptimizerImpl::optimizeCrossBlock(MachineBasicBlock &HBB) {
   CmpCondPair Head{HeadCmpMI, HeadBrMI, HeadCondCode};
   CmpCondPair True{TrueCmpMI, TrueBrMI, TrueCondCode};
 
-  return tryOptimizePair(Head, True);
+  return tryOptimizePair(Head, True, OptPath::Cross);
 }
 
 bool AArch64ConditionOptimizerLegacy::runOnMachineFunction(
