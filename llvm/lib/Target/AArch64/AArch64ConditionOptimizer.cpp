@@ -140,7 +140,6 @@ public:
 
 private:
   bool canAdjustCmp(MachineInstr &CmpMI);
-  bool nzcvLivesOut(MachineBasicBlock *MBB);
   CmpInfo getAdjustedCmpInfo(MachineInstr *CmpMI, AArch64CC::CondCode Cmp);
   void updateCmpInstr(MachineInstr *CmpMI, int NewImm, unsigned NewOpc);
   void updateCondInstr(MachineInstr *CondMI, AArch64CC::CondCode NewCC);
@@ -206,17 +205,13 @@ bool AArch64ConditionOptimizerImpl::canAdjustCmp(MachineInstr &CmpMI) {
   return true;
 }
 
-// Check if NZCV lives out to any successor block.
-bool AArch64ConditionOptimizerImpl::nzcvLivesOut(MachineBasicBlock *MBB) {
-  for (auto *SuccBB : MBB->successors()) {
-    if (SuccBB->isLiveIn(AArch64::NZCV)) {
-      LLVM_DEBUG(dbgs() << "NZCV live into successor "
-                        << printMBBReference(*SuccBB) << " from "
-                        << printMBBReference(*MBB) << '\n');
-      return true;
-    }
-  }
-  return false;
+// Returns the single non-dead physical register defined by a CMP instruction
+// (i.e. the flag register it writes to).
+static MCRegister getFlagDef(const MachineInstr &CmpMI) {
+  for (const MachineOperand &MO : CmpMI.operands())
+    if (MO.isReg() && MO.isDef() && !MO.isDead() && MO.getReg().isPhysical())
+      return MO.getReg().asMCReg();
+  llvm_unreachable("CMP has no non-dead physical def");
 }
 
 // Returns true if the opcode is a comparison instruction (CMP/CMN).
@@ -459,6 +454,7 @@ bool AArch64ConditionOptimizerImpl::commitPendingPair(
 bool AArch64ConditionOptimizerImpl::optimizeBlock(MachineBasicBlock &MBB) {
   std::optional<CmpCondPair> PendingPair;
   MachineInstr *ActiveCmp = nullptr;
+  MCRegister ActiveCmpFlag;
   bool Changed = false;
 
   for (MachineInstr &MI : MBB) {
@@ -468,11 +464,13 @@ bool AArch64ConditionOptimizerImpl::optimizeBlock(MachineBasicBlock &MBB) {
     if (isCmpInstruction(MI.getOpcode()) && canAdjustCmp(MI)) {
       Changed |= commitPendingPair(PendingPair);
       ActiveCmp = &MI;
+      ActiveCmpFlag = getFlagDef(MI);
       continue;
     }
 
-    if (MI.modifiesRegister(AArch64::NZCV, /*TRI=*/nullptr)) {
-      // Non-CMP clobber: commit any pending pair and reset local state.
+    if (ActiveCmp && MI.modifiesRegister(ActiveCmpFlag, /*TRI=*/nullptr)) {
+      // Non-CMP clobber: ActiveCmp is no longer live.
+      // Commit any pending pair and reset local state.
       Changed |= commitPendingPair(PendingPair);
       ActiveCmp = nullptr;
       continue;
@@ -496,16 +494,19 @@ bool AArch64ConditionOptimizerImpl::optimizeBlock(MachineBasicBlock &MBB) {
       continue;
     }
 
-    if (MI.readsRegister(AArch64::NZCV, /*TRI=*/nullptr)) {
+    if (ActiveCmp && MI.readsRegister(ActiveCmpFlag, /*TRI=*/nullptr)) {
+      // Non-conditional flag reader: optimization cannot proceed.
       ActiveCmp = nullptr;
       PendingPair = std::nullopt;
       continue;
     }
   }
 
-  // Only commit the final pending pair if NZCV doesn't live out: a cross-block
-  // consumer would be affected by any CMP adjustment we make.
-  if (!nzcvLivesOut(&MBB))
+  // Only commit the final pending pair if the flag register doesn't live out:
+  // a cross-block consumer would be affected by any CMP adjustment we make.
+  if (ActiveCmp && !llvm::any_of(MBB.successors(), [&](const MachineBasicBlock *S) {
+        return S->isLiveIn(ActiveCmpFlag);
+      }))
     Changed |= commitPendingPair(PendingPair);
 
   return Changed;
